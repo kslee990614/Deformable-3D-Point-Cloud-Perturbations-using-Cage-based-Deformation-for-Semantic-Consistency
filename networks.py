@@ -63,7 +63,7 @@ class PointNet2feat(nn.Module):
     pointcloud (B,3,N)
     return (B,bottleneck_size)
     """
-    def __init__(self, dim=3, num_points=2048, num_levels=3, bottleneck_size=512, normalization=None):
+    def __init__(self, dim=3, num_points=1024, num_levels=3, bottleneck_size=512, normalization=None):
         super().__init__()
         assert(dim==3)
         self.SA_modules = nn.ModuleList()
@@ -447,6 +447,50 @@ class MLPDeformer(nn.Module):
         return x
 
 
+def optimize_cage_and_face(cage, point, distance=0.3, iters=1000, step=0.01):
+    """
+    입력:
+    - cage: (B, 3, N1) 크기의 배치별 케이지 꼭짓점
+    - point: (B, 3, N2) 크기의 배치별 포인트
+    - distance: 각 포인트가 케이지에서 떨어져야 하는 최소 거리
+    - iters: 최적화를 진행할 반복 횟수
+    - step: 케이지 업데이트 스텝 크기
+    
+    출력:
+    - 최적화된 cage와 face
+    """
+    B, N2, _ = cage.shape
+    B, N1, _ = point.shape
+
+    cage = cage.transpose(1,2)
+    point = point.transpose(1,2)
+
+    point_center = point.mean(dim=1, keepdim=True)
+
+    # 케이지를 복사하여 확장 (배치 크기를 고려)
+    cage_expanded = cage.clone()
+
+    for _ in range(iters):
+        # 케이지와 포인트 사이의 벡터 계산
+        vector = point_center - cage_expanded  # 케이지의 모든 점을 원점으로부터 반대 방향으로 이동시킬 벡터
+
+        unit_vector = vector / (torch.norm(vector, dim=1, keepdim=True) + 1e-8)
+
+        # 현재 포인트와 케이지 사이의 거리 계산
+        current_distance = torch.sum((cage_expanded[:, :, None] - point[:, None, :]) ** 2, dim=-1) ** 0.5
+        
+        # 각 케이지 점에서 가장 가까운 포인트와의 최소 거리
+        min_distance, _ = torch.min(current_distance, dim=2)
+        
+        # 최소 거리보다 떨어진 경우에만 업데이트 수행
+        do_update = min_distance > distance
+
+        # 케이지 위치 업데이트 (거리보다 작은 점들에 대해만)
+        cage_expanded = cage_expanded + step * unit_vector * do_update[:, :, None]
+    
+    return cage_expanded.transpose(1,2)
+
+
 class NetworkFull(nn.Module):
     def __init__(self, opt, dim, bottleneck_size,
                  template_vertices, template_faces,
@@ -482,6 +526,7 @@ class NetworkFull(nn.Module):
         self.merger = nn.Sequential(
                 Conv1d(bottleneck_size*2, bottleneck_size*2, 1, activation="lrelu", normalization=opt.normalization),
             )
+        
         if not opt.atlas:
             self.nd_decoder = MLPDeformer(dim=dim, bottleneck_size=bottleneck_size*2, npoint=self.template_vertices.shape[-1],
                                         residual=opt.d_residual, normalization=opt.normalization)
@@ -531,6 +576,7 @@ class NetworkFull(nn.Module):
 
         # ############ Cage ################
         cage = self.template_vertices.view(1,self.dim,-1).expand(B,-1,-1)
+        cage = optimize_cage_and_face(cage, source_shape)
         if self.opt.full_net:
             cage = self.nc_decoder(s_code, cage)
             # cage.register_hook(save_grad("d_cage"))
@@ -564,6 +610,165 @@ class NetworkFull(nn.Module):
             "weight": weights,
             "weight_unnormed": weights_unnormed
         }
+    
+class NetworkFull_adv(nn.Module):
+    def __init__(self, opt, dim, bottleneck_size,
+                 template_vertices, template_faces,
+                 **kargs
+                 ):
+
+        super().__init__()
+        self.opt = opt
+        self.dim = dim
+        self.set_up_template(template_vertices, template_faces)
+
+        ###### source and target encoder ########
+        if opt.pointnet2:
+            self.encoder = PointNet2feat(dim=dim, num_points=opt.num_point, bottleneck_size=bottleneck_size)
+        else:
+            self.encoder = nn.Sequential(
+                PointNetfeat(dim=dim, num_points=opt.num_point, bottleneck_size=bottleneck_size),
+                Linear(bottleneck_size, bottleneck_size, activation="lrelu", normalization=opt.normalization)
+                )
+
+        ###### cage prediction and cage deformation ########
+        if opt.full_net:
+            if not opt.atlas:
+                self.nc_decoder = MLPDeformer(
+                    dim=dim,
+                    bottleneck_size=bottleneck_size,
+                    npoint=self.template_vertices.shape[-1],
+                    residual=opt.c_residual,
+                    normalization=opt.normalization
+                )
+            else:
+                self.nc_decoder = MultiFoldPointGen(
+                    bottleneck_size,
+                    dim,
+                    dim,
+                    n_fold=opt.n_fold,
+                    normalization=opt.normalization,
+                    concat_prim=opt.concat_prim,
+                    return_aux=False,
+                    residual=opt.c_residual
+                )
+
+        # merger의 입력 채널 수를 기존대로 유지 (bottleneck_size * 2)
+        self.merger = nn.Sequential(
+            Conv1d(bottleneck_size * 2, bottleneck_size * 2, 1, activation="lrelu", normalization=opt.normalization),
+        )
+
+        # 추가적인 레이어를 정의하여 merger의 출력과 additional_input을 처리
+        if opt.use_additional_input:
+            # 추가 입력과 merger의 출력을 결합한 후 처리할 레이어 정의
+            post_merger_input_channels = bottleneck_size * 2 + bottleneck_size  # merger 출력 + additional_input
+            self.post_merger = nn.Sequential(
+                Conv1d(post_merger_input_channels, bottleneck_size * 2, 1, activation="lrelu", normalization=opt.normalization),
+            )
+        else:
+            self.post_merger = None  # 추가 입력을 사용하지 않을 경우
+
+        if not opt.atlas:
+            self.nd_decoder = MLPDeformer(
+                dim=dim,
+                bottleneck_size=bottleneck_size * 2,  # 유지
+                npoint=self.template_vertices.shape[-1],
+                residual=opt.d_residual,
+                normalization=opt.normalization
+            )
+        else:
+            self.nd_decoder = MultiFoldPointGen(
+                bottleneck_size * 2,
+                dim,
+                dim,
+                n_fold=opt.n_fold,
+                normalization=opt.normalization,
+                concat_prim=opt.concat_prim,
+                return_aux=False,
+                residual=opt.d_residual
+            )
+
+    def set_up_template(self, template_vertices, template_faces):
+        # 템플릿 케이지 설정
+        assert(template_vertices.ndim == 3 and template_vertices.shape[1] == self.dim)  # (1, dim, V)
+        if self.dim == 3:
+            assert(template_faces.ndim == 3 and template_faces.shape[2] == 3)  # (1, F, 3)
+
+        self.register_buffer("template_faces", template_faces)
+        self.register_buffer("template_vertices", template_vertices)
+        self.template_vertices = nn.Parameter(
+            self.template_vertices,
+            requires_grad=(self.opt.optimize_template)
+        )
+        if self.template_vertices.requires_grad:
+            print("Enabled vertex optimization")
+
+    def forward(self, source_shape, target_shape, additional_input=None, alpha=1.0):
+        """
+        source_shape: (B, dim, N)
+        target_shape: (B, dim, M)
+        additional_input: (B, bottleneck_size, 1)
+        """
+        B, _, N = source_shape.shape
+        _, _, M = target_shape.shape
+        _, _, P = self.template_vertices.shape
+        
+
+        ############ Encoder #############
+        input_shapes = torch.cat([source_shape, target_shape], dim=0)  # (2B, dim, N or M)
+        shape_code = self.encoder(input_shapes)  # (2B, bottleneck_size)
+        shape_code = shape_code.unsqueeze(-1)  # (2B, bottleneck_size, 1)
+        s_code, t_code = torch.split(shape_code, B, dim=0)  # 각 (B, bottleneck_size, 1)
+
+        # ############ Cage ################
+        cage = self.template_vertices.view(1, self.dim, -1).expand(B, -1, -1)  # (B, dim, P)
+        cage = optimize_cage_and_face(cage, source_shape)
+        if self.opt.full_net:
+            cage = self.nc_decoder(s_code, cage)
+
+        ########### Deform ##########
+        # 추가 입력이 있는 경우 처리
+        if additional_input is not None:
+            if additional_input.shape[0] != B:
+                raise ValueError("additional_input의 배치 크기가 일치하지 않습니다.")
+            if additional_input.ndim == 2:
+                additional_input = additional_input.unsqueeze(-1)  # (B, bottleneck_size, 1)
+            # merger의 출력과 additional_input을 결합
+            t_code = t_code + additional_input  # (B, bottleneck_size * 2 + bottleneck_size, 1)
+
+        # 기존 방식대로 s_code와 t_code를 병합하여 target_code 생성
+        target_code = torch.cat([s_code, t_code], dim=1)  # (B, bottleneck_size * 2, 1)
+        target_code = self.merger(target_code)  # (B, bottleneck_size * 2, 1)
+
+        # 이제 target_code를 사용하여 new_cage 생성
+        new_cage = self.nd_decoder(target_code, cage)  # (B, dim, P)
+
+        ########### MVC ##############
+        if self.dim == 3:
+            cage = cage.transpose(1, 2).contiguous()      # (B, P, dim)
+            new_cage = new_cage.transpose(1, 2).contiguous()  # (B, P, dim)
+            deformed_shapes, weights, weights_unnormed = deform_with_MVC(
+                cage,
+                new_cage,
+                self.template_faces.expand(B, -1, -1),
+                source_shape.transpose(1, 2).contiguous(),
+                verbose=True
+            )
+        elif self.dim == 2:
+            weights, weights_unnormed = mean_value_coordinates(source_shape, cage, verbose=True)
+            deformed_shapes = torch.sum(weights.unsqueeze(1) * new_cage.unsqueeze(-1), dim=2).transpose(1, 2).contiguous()
+            cage = cage.transpose(1, 2)
+            new_cage = new_cage.transpose(1, 2)
+
+        return {
+            "cage": cage,
+            "new_cage": new_cage,
+            "deformed": deformed_shapes,
+            "cage_face": self.template_faces,
+            "weight": weights,
+            "weight_unnormed": weights_unnormed
+        }
+
 
 
 

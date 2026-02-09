@@ -133,6 +133,7 @@ def deform_with_MVC(cage, cage_deformed, cage_face, query, verbose=False):
     cage_face (B,F,3) int64
     query (B,Q,3)
     """
+    
     weights, weights_unnormed = mean_value_coordinates_3D(query, cage, cage_face, verbose=True)
 #     weights = weights.detach()
     deformed = torch.sum(weights.unsqueeze(-1)*cage_deformed.unsqueeze(1), dim=2)

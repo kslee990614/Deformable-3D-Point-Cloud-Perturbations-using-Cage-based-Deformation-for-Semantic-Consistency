@@ -21,6 +21,8 @@ from pytorch_points.utils.geometry_utils import Mesh, get_edge_points
 from pytorch_points.misc import logger
 from losses import LabeledChamferDistance
 from common import find_files, renderMeshes, call_proc, read_trimesh
+from joblib import Parallel, delayed
+from tqdm import tqdm
 
 labeled_chamfer_distance = LabeledChamferDistance(beta=1.0, gamma=1, delta=0)
 
@@ -319,16 +321,17 @@ def _unwrap_self(arg, **kwarg):
 
 class ShapeNetSeg(torch.utils.data.Dataset):
     def __init__(self, root_dir="/home/mnt/points/data/ShapeNet/PartSeg_v0/shapenetcore_partanno_segmentation_benchmark_v0_normal",
-                 mesh_dir="/home/mnt/points/data/ShapeNet/ShapeNetCore.v1.remesh",
+                 mesh_dir="/workspace/deep_cage/data/ShapeNetCore.v1.remesh",
                  num_samples=-1, normalization="BoundingBox", knn=False,
                  num_neighbors=20,
-                 class_choice=None, phase="train", normal=False, npoints=2500, sample=True,
+                 class_choice=None, phase="train", normal=False, npoints=5000, sample=True,
                  data_augmentation_Z_rotation=False, data_augmentation_Z_rotation_range=360,
                  data_augmentation_3D_rotation=False, random_translation=False, anisotropic_scaling=False,
                  shuffle=False, use_fixed_pairs=False, use_preprocessed=True, isV2=False, **kwargs):
         self.mesh_data = False
         self.use_init_cage = False
         self.use_preprocessed = use_preprocessed
+        #self.use_preprocessed = False
         self.isV2 = isV2
         self.v2_rot_mat = torch.from_numpy(pc_utils.get_3D_rot_matrix(1, np.pi/2).astype(np.float32))
         self.dataset_string_args = str(phase) + "_" + \
@@ -339,7 +342,7 @@ class ShapeNetSeg(torch.utils.data.Dataset):
         self.path_dataset = os.path.join("./data/processed_shapenetseg", self.dataset_string_args)
         os.makedirs(os.path.dirname(self.path_dataset), exist_ok=True)
         self.shuffle = shuffle
-        self.num_samples = num_samples
+        self.num_samples = -1
         self.anisotropic_scaling = anisotropic_scaling
         self.fine_tune = (phase == 'fine_tune_test')
         if phase == 'fine_tune_test':
@@ -372,7 +375,6 @@ class ShapeNetSeg(torch.utils.data.Dataset):
         #     print("Downloading Shapetnet for segmentation...")
         #     os.system('chmod +x ./data/download_dataset_shapenet.sh')
         #     os.system('./data/download_dataset_shapenet.sh')
-        # ----------------------------------------------------------#
         ## Create dictionaries with keys : name of class, value : name of folder and vice-versa
         with open(self.catfile, 'r') as f:
             for line in f:
@@ -382,32 +384,39 @@ class ShapeNetSeg(torch.utils.data.Dataset):
                 self.numbercat2namecat[ls[1]] = ls[0]
                 self.meta[ls[0]] = []  # List to store all path of files per category
 
-        # ----------------------------------------------------------#
         # add all paths to the same list, keep track of sizes
         for cat in self.meta.keys():
             for file in self.meta[cat]:
                 self.datapath.append(file)
 
         # fixed pairs? create or load a dict of source_target_pairs storing the cat/file_name: cat/file_name
-        if self.use_fixed_pairs and self.phase in ("val", "test", "svr_test"):
-            if os.path.exists(self.path_dataset + "_pairs.txt"):
-                source_target_file = np.loadtxt(self.path_dataset + "_pairs.txt", dtype=str)
-                self.source_target_pairs = source_target_file
-                self.datas = [(None, self.numbercat2namecat[source.split("/")[0]], os.path.join(self.root, source)) for source, _ in self.source_target_pairs]
-                self.datas += [(None, self.numbercat2namecat[source.split("/")[0]], os.path.join(self.root, source)) for _, source in self.source_target_pairs]
-                self.datapath = self.source_target_pairs
-
-        if not use_fixed_pairs or len(self.source_target_pairs)==0:
+        #if self.use_fixed_pairs and self.phase in ("val", "test", "svr_test"):
+        #    if os.path.exists(self.path_dataset + "_pairs.txt"):
+        #        source_target_file = np.loadtxt(self.path_dataset + "_pairs.txt", dtype=str)
+        #        self.source_target_pairs = source_target_file
+        #        self.datas = [(None, self.numbercat2namecat[source.split("/")[0]], os.path.join(self.root, source)) for source, _ in self.source_target_pairs]
+        #        self.datas += [(None, self.numbercat2namecat[source.split("/")[0]], os.path.join(self.root, source)) for _, source in self.source_target_pairs]
+        #        self.datapath = list(self.source_target_pairs)
+ 
+        if True:
             if self.phase == "train":
                 with open(os.path.join(os.path.join(self.root, "train_test_split"), 'shuffled_train_file_list.json')) as f:
                     file_list = json.load(f)
             if self.phase == "val":
                 with open(os.path.join(os.path.join(self.root, "train_test_split"), 'shuffled_val_file_list.json')) as f:
                     file_list = json.load(f)
-            if "test" in self.phase :
+            if self.phase == "test":
+                with open(os.path.join(os.path.join(self.root, "train_test_split"), 'shuffled_test_file_list.json')) as f:
+                    file_list = json.load(f)
+            if self.phase == "adv_train":
+                print(os.path.join(os.path.join(self.root, "train_test_split"), 'shuffled_train_file_list.json'))
+                with open(os.path.join(os.path.join(self.root, "train_test_split"), 'shuffled_train_file_list.json')) as f:
+                    file_list = json.load(f)
+            if self.phase == "adv_train_feature":
                 with open(os.path.join(os.path.join(self.root, "train_test_split"), 'shuffled_test_file_list.json')) as f:
                     file_list = json.load(f)
 
+            
             for file in file_list:
                 # Typical example : shape_data/03001627/355fa0f35b61fdd7aa74a6b5ee13e775 so remove 'shape_data/' and add '.txt'
                 file_path = os.path.join(self.root, file[11:]) + ".txt"
@@ -417,7 +426,8 @@ class ShapeNetSeg(torch.utils.data.Dataset):
                         (file_path, self.numbercat2namecat[number_category]))
                     self.numsamples_by_cat[self.numbercat2namecat[number_category]] = self.numsamples_by_cat[
                                                                                           self.numbercat2namecat[
-                                                                                              number_category]] + 1
+                                                                                              number_category]] + 1        
+   
             # ----------------------------------------------------------#
             # add all paths to the same list, keep track of sizes
             for cat in self.meta.keys():
@@ -428,6 +438,7 @@ class ShapeNetSeg(torch.utils.data.Dataset):
                 self.preprocess()
             else:
                 self.datas = [(None, file[1], file[0]) for file in self.datapath]
+            
 
             if self.knn:
                 start = time.time()
@@ -440,7 +451,7 @@ class ShapeNetSeg(torch.utils.data.Dataset):
 
             else:
                 self.source_target_pairs = []
-                for i in range(len(self.datapath)):
+                for i in range(len(self.datas)):
                     _, cat, filename = self.datas[i]
                     filename = os.path.basename(filename)
                     if self.knn:
@@ -449,7 +460,8 @@ class ShapeNetSeg(torch.utils.data.Dataset):
                         j = np.random.randint(len(self.datas))
                     _, cat2, filename2 = self.datas[j]
                     filename2 = os.path.basename(filename2)
-                    self.source_target_pairs = (self.namecat2numbercat[cat]+"/"+filename, self.namecat2numbercat[cat2]+"/"+filename2)
+                    self.source_target_pairs.append((self.namecat2numbercat[cat]+"/"+filename, self.namecat2numbercat[cat2]+"/"+filename2))
+
                 with open(self.path_dataset + "_pairs.txt","w") as f:
                     for key, value in self.source_target_pairs:
                         f.write("{} {}\n".format(key, value))
@@ -546,7 +558,7 @@ class ShapeNetSeg(torch.utils.data.Dataset):
             self.datas = joblib.Parallel(n_jobs=-1, backend="multiprocessing")(
                 joblib.delayed(_unwrap_self)(i) for i in zip([self] * len(self.datapath), range(len(self.datapath))))
             self.datas = list(filter(None, self.datas))
-
+            print(self.path_dataset)
             with open(self.path_dataset + ".pkl", "wb") as fp:  # Pickling
                 pickle.dump(self.datas, fp)
 
@@ -601,13 +613,15 @@ class ShapeNetSeg(torch.utils.data.Dataset):
                 points = pc_utils.load(found[0])
 
             points = self.normalize(points[:,:3])
+            points = points[:,:3]
             points = torch.from_numpy(points).float()
 
         points = points.clone()
         # Resample
-        if self.sample:
-            choice = np.random.choice(points.size(0), self.npoints, replace=True)
-            points = points[choice, :]
+        #if self.sample:
+        #    print("now_sampling")
+        #    choice = np.random.choice(points.size(0), self.npoints, replace=True)
+        #    points = points[choice, :]
 
         rot_matrix = pc_utils.uniform_rotation_axis_matrix(axis=1, range_rot=self.data_augmentation_Z_rotation_range)
         if self.data_augmentation_Z_rotation:
@@ -626,22 +640,23 @@ class ShapeNetSeg(torch.utils.data.Dataset):
         if self.random_translation:
             points = pc_utils.add_random_translation(points, scale=0.03)
         # also load mesh during test
-        if self.phase == "test" and self.mesh_dir is not None:
-            mesh_path = os.path.join(self.mesh_dir, self.namecat2numbercat[cat], file_name, "model.obj")
-            V_mesh, F_mesh = read_trimesh(mesh_path)
-            V_mesh = V_mesh[:,:3]
-            F_mesh = F_mesh[:,:3]
-            # V_mesh = (V_mesh - center)/scale
-            V_mesh = self.normalize(V_mesh)
+        #if self.phase == "test" and self.mesh_dir is not None:
+        #    mesh_path = os.path.join(self.mesh_dir, self.namecat2numbercat[cat], file_name, "model.obj")
+        #    V_mesh, F_mesh = read_trimesh(mesh_path)
+        #    V_mesh = V_mesh[:,:3]
+        #    F_mesh = F_mesh[:,:3]
+        #    # V_mesh = (V_mesh - center)/scale
+        #    V_mesh = self.normalize(V_mesh)
 
-            V_mesh = torch.from_numpy(V_mesh).to(dtype=torch.float)
-            F_mesh = torch.from_numpy(F_mesh).to(dtype=torch.int64)
-            return points, V_mesh, F_mesh, cat, file_name
-        else:
-            return points, cat, file_name
+        #    V_mesh = torch.from_numpy(V_mesh).to(dtype=torch.float)
+        #    F_mesh = torch.from_numpy(F_mesh).to(dtype=torch.int64)
+        #    return points, V_mesh, F_mesh, cat, file_name
+        #else:
+        return points, cat, file_name
         # ----------------------------------------------------------#
 
     def __getitem__(self, index):
+        self.use_fixed_pairs = False
         if self.use_fixed_pairs:
             # _, cat, filename = self.datas[index]
             # target = self.source_target_pairs[self.namecat2numbercat[cat]+'/'+os.path.basename(filename)]
@@ -654,8 +669,8 @@ class ShapeNetSeg(torch.utils.data.Dataset):
             if self.knn:
                 index_2 = self.indices[index][np.random.randint(self.num_neighbors)]
             else:
-                index_2 = np.random.randint(self.__len__())
-
+                #index_2 = np.random.randint(self.__len__())
+                index_2 = index - (len(self.source_target_pairs)-1)
         source_data = self.getAnItem(index)
         target_data = self.getAnItem(index_2)
 
@@ -691,6 +706,7 @@ class ShapeNetSeg(torch.utils.data.Dataset):
                 return min(self.num_samples, len(self.source_target_pairs))
             return len(self.source_target_pairs)
 
+        
         if self.num_samples > 0:
             return min(len(self.datas), self.num_samples)
         else:
@@ -704,6 +720,7 @@ class ShapeNetSeg(torch.utils.data.Dataset):
         up = (-0.1,0.2,-0.1)
         # if "color" not in kwargs:
         #     kwargs["color"] = "eebad6a9"
+        print(shape_dir)
         renderMeshes(shape_dir, up=up, forward=forward, pos=pos, **kwargs)
 
 class ShapeNetV2(ShapeNetSeg):
@@ -967,7 +984,8 @@ class PairedSurreal(torch.utils.data.Dataset):
         if self.phase == "train":
             self.len = len(self.datas) if max < 0 else max # self.datas.shape[0] 230000
         else:
-            self.len = 100 if max < 0 else max
+            self.len = len(self.datas) if max < 0 else max
+            #self.len = 100 if max < 0 else max
 
         self.mesh_vertex, self.mesh_face = read_trimesh(source)
         self.mesh_vertex = self.mesh_vertex[:,:3].astype(np.float32)

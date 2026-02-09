@@ -25,7 +25,7 @@ class BaseOptions():
                             choices=["COSEG", "FAUST", "SHAPENET", "SHAPENETV2", "SURREAL", "MNIST_SINGLE", "MNIST_MIXED"])
         parser.add_argument("--isV2", action="store_true", help="using Shapenetv2 for shapenetseg dataset")
         parser.add_argument("--no-preprocessed", dest="use_preprocessed", action="store_false", help="using preprocessed")
-        parser.add_argument("--num_point", type=int, help="number of input points", default=2048)
+        parser.add_argument("--num_point", type=int, help="number of input points", default=5000)
         parser.add_argument("--regular_sampling", action="store_true", help="sample considering face area")
         parser.add_argument("--template", type=str, help="cage template", default="data/sphere_V42_F80.off")
         parser.add_argument("--source_model", type=str, nargs="*", help="source model for testing")
@@ -65,10 +65,11 @@ class BaseOptions():
         parser.add_argument("--beta", type=float, help="weight controlling hausdorff", default=0)
         parser.add_argument("--gamma", type=float, help="weight controlling reverse chamfer distance", default=1.0)
         parser.add_argument("--delta", type=float, help="weight controlling scaled reverse chamfer distance", default=0)
+        parser.add_argument("--adv_weight", type=float, help="adversarial loss", default=1.0)
         # training setup
         parser.add_argument("--nepochs", type=int, help="total number of epochs", default=50)
         parser.add_argument("--warmup_epochs", type=float, help="train deformer only before update cage", default=0.5)
-        parser.add_argument("--phase", type=str, choices=["test", "train", "svr_test"], default="train")
+        parser.add_argument("--phase", type=str, choices=["test", "train", "svr_test", "adv_train", "adv_train_feature"], default="train")
         parser.add_argument("--ckpt", type=str, help="test model")
         parser.add_argument("--epoch", type=int, help="resume training from this epoch")
         parser.add_argument("--alternate_cd", action="store_true", help="altenately udpate net_c and net_d")
@@ -91,6 +92,8 @@ class BaseOptions():
         parser.add_argument("--disable_enc_code", dest="use_enc_code", action="store_false", help="concatenate encoder's code in decoder")
         parser.add_argument("--mlp", dest="atlas", action="store_false", help="use mlp type of network")
         parser.add_argument("--use_pretrained", action="store_true", help="use pretrained AtlasNet encoder for nc and nd")
+        parser.add_argument("--use_additional_input", action="store_true", help="NetworkFull 모델에서 추가 입력을 사용합니다.")
+
         self.initialized = True
         return parser
 
