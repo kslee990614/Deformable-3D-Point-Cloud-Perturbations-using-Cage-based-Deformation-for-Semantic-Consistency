@@ -26,6 +26,7 @@ class AllLosses(torch.nn.Module):
         self.cage_smooth_loss = MeshSmoothLoss(torch.nn.MSELoss(reduction="mean"), use_cot=False, use_norm=True)
         self.grounding_loss = GroundingLoss(up_dim=(1 if "SHAPENET" in opt.dataset else 2))
         if opt.sym_plane is not None:
+            print("==================================================================")
             self.symmetry_loss = SymmetryLoss(sym_plane=opt.sym_plane, NCHW=False).cuda()
         # mesh_chamfer_loss = losses.InterpolatedCDTriMesh(interpolate_n=5, beta=1.0, gamma=0.0, delta=1/30)
         # cage_inside_loss = InsideLoss3DTriMesh(reduction="max")
@@ -70,6 +71,14 @@ class AllLosses(torch.nn.Module):
             self.loss["CD"] *= self.opt.loss_weight
             self.idx12 = idx12.to(dtype=torch.int64)
             self.idx21 = idx21.to(dtype=torch.int64)
+
+            loss, idx12, idx21  = self.labeled_chamfer_loss(all_outputs["deformed"],
+                                                all_inputs["source_shape"])
+            self.loss["SCD"] = loss
+            self.loss["SCD"] *= self.opt.loss_weight
+            self.idx12 = idx12.to(dtype=torch.int64)
+            self.idx21 = idx21.to(dtype=torch.int64)
+
             # S-to-S use MSE
             dist = torch.sum((all_outputs["deformed"][self.opt.batch_size*2:, :, :] - all_inputs["target_shape"][self.opt.batch_size*2:,:,:])**2, dim=-1)
             self.loss["MSE"] += dist.mean()*self.opt.loss_weight
